@@ -4,12 +4,15 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import bcrypt
+import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -24,6 +27,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).parent
+
+# JWT Configuration
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "matrix-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+security = HTTPBearer()
+
+
+# Auth Models
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    created_at: datetime
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+
+# Post Models
+class PostCreate(BaseModel):
+    wall_owner: str
+    content: str
+
+
+class Post(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    wall_owner: str
+    author: str
+    content: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StatusCheck(BaseModel):
@@ -95,6 +142,43 @@ async def _get_or_create_agent(request: Request, agent_type: str):
     return cache[agent_type]
 
 
+# Auth Helper Functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    db = _ensure_db(request)
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = await db.users.find_one({"username": username})
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv(ROOT_DIR / ".env")
@@ -131,7 +215,101 @@ api_router = APIRouter(prefix="/api")
 
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Welcome to the Matrix"}
+
+
+# Authentication Endpoints
+@api_router.post("/register", response_model=TokenResponse)
+async def register(user_data: UserRegister, request: Request):
+    db = _ensure_db(request)
+
+    # Check if username exists
+    existing_user = await db.users.find_one({"username": user_data.username})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Create user
+    user_id = str(uuid.uuid4())
+    hashed_pw = hash_password(user_data.password)
+    user = {
+        "_id": user_id,
+        "username": user_data.username,
+        "password": hashed_pw,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    await db.users.insert_one(user)
+
+    # Create access token
+    access_token = create_access_token(data={"sub": user_data.username})
+
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(id=user_id, username=user_data.username, created_at=user["created_at"]),
+    )
+
+
+@api_router.post("/login", response_model=TokenResponse)
+async def login(credentials: UserLogin, request: Request):
+    db = _ensure_db(request)
+
+    user = await db.users.find_one({"username": credentials.username})
+    if not user or not verify_password(credentials.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    access_token = create_access_token(data={"sub": user["username"]})
+
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserResponse(id=user["_id"], username=user["username"], created_at=user["created_at"]),
+    )
+
+
+# Wall Post Endpoints
+@api_router.post("/posts", response_model=Post)
+async def create_post(post_data: PostCreate, request: Request, current_user: dict = Depends(get_current_user)):
+    db = _ensure_db(request)
+
+    # Verify wall owner exists
+    wall_owner_user = await db.users.find_one({"username": post_data.wall_owner})
+    if not wall_owner_user:
+        raise HTTPException(status_code=404, detail="Wall owner not found")
+
+    # Create post
+    post = Post(
+        wall_owner=post_data.wall_owner,
+        author=current_user["username"],
+        content=post_data.content,
+    )
+
+    await db.posts.insert_one(post.model_dump())
+
+    return post
+
+
+@api_router.get("/posts/{username}", response_model=List[Post])
+async def get_user_posts(username: str, request: Request):
+    db = _ensure_db(request)
+
+    # Verify user exists
+    user = await db.users.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Get all posts for this wall
+    posts = await db.posts.find({"wall_owner": username}).sort("created_at", -1).to_list(1000)
+
+    return [Post(**post) for post in posts]
+
+
+@api_router.get("/users", response_model=List[UserResponse])
+async def get_users(request: Request):
+    db = _ensure_db(request)
+
+    users = await db.users.find().to_list(1000)
+    return [UserResponse(id=user["_id"], username=user["username"], created_at=user["created_at"]) for user in users]
 
 
 @api_router.post("/status", response_model=StatusCheck)
